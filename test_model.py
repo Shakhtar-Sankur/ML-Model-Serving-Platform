@@ -1,3 +1,5 @@
+import base64
+
 import numpy as np
 import tensorflow as tf
 from ml_serving_platform import ModelTrainer, ImageProcessor
