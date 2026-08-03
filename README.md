@@ -16,11 +16,11 @@ about everything around that call, which is where production time actually goes.
 | `ABTestManager` | Splitting traffic across versions |
 | `CircuitBreaker` | Failing fast when a backend is unhealthy instead of queueing |
 | `HealthChecker` | Liveness for Triton, Redis and the model itself |
-| `DataDriftDetector` | Watching input distribution against the training reference |
+| `DataDriftDetector` | Per-feature KS test against the training reference, Bonferroni-corrected |
 | `PerformanceProfiler` | Per-stage timing |
 | `MetricsCollector` | Prometheus counters and histograms |
 | `CacheManager` | Redis-backed response cache |
-| `SecurityManager` | API-key auth and rate limiting |
+| `SecurityManager` | API-key auth (constant-time) and an atomic fixed-window rate limit |
 | `ImageProcessor` | Decode, resize, normalise |
 | `ModelTrainer` | Training and export |
 | `TritonClient` | Inference backend |
@@ -52,8 +52,31 @@ pytest test_api.py test_model.py
 
 ## Status
 
-Complete service implementation with tests. Requires a Triton backend and a Redis
-instance; no trained model is bundled.
+Complete service implementation with tests. Requires a Triton backend and a Redis instance;
+no trained model is bundled.
+
+### Notes from a correctness pass
+
+Five defects fixed, one of them a security hole:
+
+- **An empty API key authenticated.** `api_key in os.getenv('VALID_API_KEYS', '').split(',')`
+  splits an unset variable to `['']`, so an empty key matched — and unset is the default
+  deployment state. A trailing comma in the variable did the same. Empty entries are now
+  dropped, an unconfigured service rejects everything, and the comparison is constant time.
+- **The rate limiter was not atomic.** It read the counter, compared, then incremented, so
+  concurrent requests all read the same value and all passed. It could also lose its expiry:
+  if the key lapsed between the read and the `INCR`, the counter came back with no TTL and
+  that client stayed limited forever. Now a single pipelined `INCR` plus `TTL`.
+- **The circuit breaker never reset on success.** `failure_count` only cleared on the
+  half-open to closed transition, so five unrelated failures spread over weeks eventually
+  tripped a healthy backend. It also mutated shared state without a lock while Flask served
+  requests concurrently.
+- **Drift detection flattened every feature into one distribution**, so a shift in one
+  feature could be cancelled by an opposite shift in another and the result was not
+  interpretable even when it fired. Now one KS test per feature, with the threshold divided
+  by the feature count, and the report names which features moved.
+- `profile_inference` did not use `functools.wraps`, so decorating a Flask view erased its
+  name and broke routing.
 
 ## Licence
 
