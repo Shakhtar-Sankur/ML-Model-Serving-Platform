@@ -18,6 +18,12 @@ import redis
 from PIL import Image
 import io
 import base64
+import functools
+import threading
+
+class CircuitBreakerOpen(Exception):
+    """Raised when the breaker is open and the call was not attempted."""
+
 
 class CircuitBreaker:
     def __init__(self, failure_threshold=5, timeout=60):
@@ -26,44 +32,56 @@ class CircuitBreaker:
         self.failure_count = 0
         self.last_failure_time = None
         self.state = "CLOSED"
-        
+        self._lock = threading.Lock()
+
     def call(self, func, *args, **kwargs):
-        if self.state == "OPEN":
-            if time.time() - self.last_failure_time > self.timeout:
-                self.state = "HALF_OPEN"
-            else:
-                raise Exception("Circuit breaker is OPEN")
-                
+        """Run `func`, tripping open once failures reach the threshold.
+
+        Two changes from the original. A success while closed now resets the
+        counter: it used to only reset on the half-open to closed transition, so
+        five unrelated failures spread over a month eventually tripped a
+        perfectly healthy backend. And the state is guarded by a lock, because
+        Flask serves requests concurrently and the counter was being updated from
+        several threads at once.
+        """
+        with self._lock:
+            if self.state == "OPEN":
+                if time.time() - self.last_failure_time > self.timeout:
+                    self.state = "HALF_OPEN"
+                else:
+                    raise CircuitBreakerOpen("Circuit breaker is OPEN")
+
         try:
             result = func(*args, **kwargs)
-            if self.state == "HALF_OPEN":
-                self.state = "CLOSED"
-                self.failure_count = 0
-            return result
-        except Exception as e:
-            self.failure_count += 1
-            self.last_failure_time = time.time()
-            
-            if self.failure_count >= self.failure_threshold:
-                self.state = "OPEN"
-            raise e
+        except Exception:
+            with self._lock:
+                self.failure_count += 1
+                self.last_failure_time = time.time()
+                if self.failure_count >= self.failure_threshold:
+                    self.state = "OPEN"
+            raise
+
+        with self._lock:
+            self.state = "CLOSED"
+            self.failure_count = 0
+        return result
 
 class ModelVersionManager:
     def __init__(self, s3_bucket):
         self.s3_bucket = s3_bucket
         self.s3_client = boto3.client('s3')
         self.current_version = "v1"
-        
+
     def deploy_new_version(self, model_path, version):
         for root, dirs, files in os.walk(model_path):
             for file in files:
                 local_path = os.path.join(root, file)
                 s3_path = f"models/{version}/" + os.path.relpath(local_path, model_path)
                 self.s3_client.upload_file(local_path, self.s3_bucket, s3_path)
-                
+
     def rollback_version(self, version):
         self.current_version = version
-        
+
     def get_model_versions(self):
         response = self.s3_client.list_objects_v2(
             Bucket=self.s3_bucket,
@@ -79,26 +97,27 @@ class ModelVersionManager:
 class PerformanceProfiler:
     def __init__(self):
         self.metrics = {}
-        
+
     def profile_inference(self, func):
+        @functools.wraps(func)
         def wrapper(*args, **kwargs):
             start_time = time.time()
             start_memory = self.get_memory_usage()
-            
+
             result = func(*args, **kwargs)
-            
+
             end_time = time.time()
             end_memory = self.get_memory_usage()
-            
+
             self.metrics[func.__name__] = {
                 'latency': end_time - start_time,
                 'memory_delta': end_memory - start_memory,
                 'timestamp': time.time()
             }
-            
+
             return result
         return wrapper
-        
+
     def get_memory_usage(self):
         import psutil
         process = psutil.Process(os.getpid())
@@ -108,32 +127,53 @@ class DataDriftDetector:
     def __init__(self, reference_data):
         self.reference_data = reference_data
         self.drift_threshold = 0.05
-        
+
     def detect_drift(self, new_data):
+        """Two-sample KS test per feature, with a Bonferroni correction.
+
+        Flattening every feature into a single distribution, as this used to do,
+        compares a mixture against a mixture: a shift in one feature can be
+        cancelled by an opposite shift in another, and the result is not
+        interpretable even when it fires. Testing each feature separately says
+        *which* feature moved.
+
+        Running one test per feature also inflates the false-positive rate, so
+        the threshold is divided by the number of features.
+        """
         from scipy import stats
-        
-        reference_mean = np.mean(self.reference_data, axis=0)
-        new_mean = np.mean(new_data, axis=0)
-        
-        ks_statistic, p_value = stats.ks_2samp(
-            self.reference_data.flatten(),
-            new_data.flatten()
-        )
-        
-        drift_detected = p_value < self.drift_threshold
-        
+
+        reference = np.asarray(self.reference_data)
+        current = np.asarray(new_data)
+        reference_2d = reference.reshape(len(reference), -1)
+        current_2d = current.reshape(len(current), -1)
+
+        n_features = reference_2d.shape[1]
+        corrected_threshold = self.drift_threshold / max(n_features, 1)
+
+        per_feature = []
+        for i in range(n_features):
+            ks_statistic, p_value = stats.ks_2samp(reference_2d[:, i], current_2d[:, i])
+            per_feature.append({
+                'feature': i,
+                'ks_statistic': float(ks_statistic),
+                'p_value': float(p_value),
+                'drifted': bool(p_value < corrected_threshold),
+            })
+
+        drifted = [f for f in per_feature if f['drifted']]
         return {
-            'drift_detected': drift_detected,
-            'p_value': p_value,
-            'ks_statistic': ks_statistic,
-            'reference_mean': reference_mean.tolist(),
-            'new_mean': new_mean.tolist()
+            'drift_detected': bool(drifted),
+            'drifted_features': [f['feature'] for f in drifted],
+            'threshold': corrected_threshold,
+            'per_feature': per_feature,
+            'reference_mean': np.mean(reference_2d, axis=0).tolist(),
+            'new_mean': np.mean(current_2d, axis=0).tolist(),
         }
 
 class ABTestManager:
     def __init__(self):
         self.experiments = {}
-        
+
     def create_experiment(self, name, model_a, model_b, traffic_split=0.5):
         self.experiments[name] = {
             'model_a': model_a,
@@ -142,34 +182,34 @@ class ABTestManager:
             'results_a': [],
             'results_b': []
         }
-        
+
     def route_request(self, experiment_name, request_data):
         experiment = self.experiments[experiment_name]
-        
+
         if np.random.random() < experiment['traffic_split']:
             model = experiment['model_a']
             result_list = experiment['results_a']
         else:
             model = experiment['model_b']
             result_list = experiment['results_b']
-            
+
         result = model.predict(request_data)
         result_list.append(result)
-        
+
         return result
-        
+
     def analyze_experiment(self, experiment_name):
         experiment = self.experiments[experiment_name]
-        
+
         results_a = np.array(experiment['results_a'])
         results_b = np.array(experiment['results_b'])
-        
+
         if len(results_a) == 0 or len(results_b) == 0:
             return {"error": "Insufficient data for analysis"}
-            
+
         from scipy import stats
         t_stat, p_value = stats.ttest_ind(results_a, results_b)
-        
+
         return {
             'model_a_performance': np.mean(results_a),
             'model_b_performance': np.mean(results_b),
@@ -183,23 +223,49 @@ class ABTestManager:
 class SecurityManager:
     @staticmethod
     def validate_api_key(api_key):
-        valid_keys = os.getenv('VALID_API_KEYS', '').split(',')
-        return api_key in valid_keys
-        
+        """Check a key against VALID_API_KEYS, failing closed.
+
+        This used to be `api_key in os.getenv('VALID_API_KEYS', '').split(',')`.
+        With the variable unset that splits to `['']`, so an empty key
+        authenticated — and unset is the default deployment state. A trailing
+        comma in the variable did the same thing.
+
+        Empty entries are now dropped, an unconfigured service rejects
+        everything, and the comparison is constant time so a key cannot be
+        recovered by timing the response.
+        """
+        import secrets
+
+        valid_keys = [k.strip() for k in os.getenv('VALID_API_KEYS', '').split(',') if k.strip()]
+        if not valid_keys or not api_key:
+            return False
+        return any(secrets.compare_digest(api_key, key) for key in valid_keys)
+
     @staticmethod
     def rate_limit_check(client_id, max_requests=1000, window=3600):
+        """Fixed-window rate limit, incremented atomically.
+
+        The previous version read the counter, compared it, then incremented.
+        Concurrent requests all read the same value and all passed, which is
+        exactly the situation a rate limiter exists for. It could also lose the
+        expiry: if the key expired between the read and the INCR, INCR recreated
+        it with no TTL and that client stayed limited forever.
+
+        INCR now happens first and the TTL is set on the request that creates the
+        window, both inside one pipeline.
+        """
         cache_key = f"rate_limit:{client_id}"
-        current_count = cache_manager.redis_client.get(cache_key)
-        
-        if current_count is None:
-            cache_manager.redis_client.setex(cache_key, window, 1)
-            return True
-        elif int(current_count) < max_requests:
-            cache_manager.redis_client.incr(cache_key)
-            return True
-        else:
-            return False
-            
+        pipe = cache_manager.redis_client.pipeline()
+        pipe.incr(cache_key)
+        pipe.ttl(cache_key)
+        count, ttl = pipe.execute()
+
+        # -1 means the key exists with no expiry, -2 means it is already gone
+        if ttl is None or ttl < 0:
+            cache_manager.redis_client.expire(cache_key, window)
+
+        return int(count) <= max_requests
+
     @staticmethod
     def sanitize_input(image_data):
         try:
@@ -213,14 +279,14 @@ class SecurityManager:
 class HealthChecker:
     def __init__(self):
         self.checks = {}
-        
+
     def add_check(self, name, check_func):
         self.checks[name] = check_func
-        
+
     def run_health_checks(self):
         results = {}
         overall_status = "healthy"
-        
+
         for name, check_func in self.checks.items():
             try:
                 result = check_func()
@@ -228,16 +294,16 @@ class HealthChecker:
             except Exception as e:
                 results[name] = {"status": "unhealthy", "error": str(e)}
                 overall_status = "unhealthy"
-                
+
         return {"overall_status": overall_status, "checks": results}
 
 class ModelTrainer:
     def __init__(self):
         self.model = None
-        
+
     def create_model(self):
         base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
-        
+
         model = tf.keras.Sequential([
             base_model,
             tf.keras.layers.GlobalAveragePooling2D(),
@@ -245,20 +311,20 @@ class ModelTrainer:
             tf.keras.layers.Dropout(0.5),
             tf.keras.layers.Dense(1000, activation='softmax')
         ])
-        
+
         model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
             loss='categorical_crossentropy',
             metrics=['accuracy']
         )
-        
+
         self.model = model
         return model
-    
+
     def save_for_triton(self, model_path):
         os.makedirs(f"{model_path}/1", exist_ok=True)
         self.model.save(f"{model_path}/1/model.savedmodel")
-        
+
         config_pbtxt = """
 name: "image_classifier"
 platform: "tensorflow_savedmodel"
@@ -279,7 +345,7 @@ output [
 ]
 version_policy: { all { } }
 """
-        
+
         with open(f"{model_path}/config.pbtxt", "w") as f:
             f.write(config_pbtxt)
 
@@ -287,7 +353,7 @@ class TritonClient:
     def __init__(self, triton_url="http://triton-server:8000"):
         self.triton_url = triton_url
         self.model_name = "image_classifier"
-        
+
     async def predict(self, image_data):
         async with aiohttp.ClientSession() as session:
             payload = {
@@ -300,7 +366,7 @@ class TritonClient:
                     }
                 ]
             }
-            
+
             async with session.post(
                 f"{self.triton_url}/v2/models/{self.model_name}/infer",
                 json=payload
@@ -318,7 +384,7 @@ class ImageProcessor:
         img_array = np.expand_dims(img_array, axis=0)
         img_array = preprocess_input(img_array)
         return img_array
-    
+
     @staticmethod
     def decode_base64_image(base64_string):
         return base64.b64decode(base64_string)
@@ -327,20 +393,20 @@ class MetricsCollector:
     def __init__(self):
         self.request_count = Counter('http_requests_total', 'Total HTTP requests', ['method', 'endpoint'])
         self.request_duration = Histogram('http_request_duration_seconds', 'HTTP request duration')
-        
+
     def inc_request_count(self, method, endpoint):
         self.request_count.labels(method=method, endpoint=endpoint).inc()
-        
+
     def observe_request_duration(self, duration):
         self.request_duration.observe(duration)
 
 class CacheManager:
     def __init__(self, redis_host='redis-service', redis_port=6379):
         self.redis_client = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
-        
+
     def get_prediction(self, image_hash):
         return self.redis_client.get(f"prediction:{image_hash}")
-        
+
     def set_prediction(self, image_hash, prediction, ttl=3600):
         self.redis_client.setex(f"prediction:{image_hash}", ttl, json.dumps(prediction))
 
@@ -377,7 +443,7 @@ def before_request():
         api_key = request.headers.get('X-API-Key')
         if not security_manager.validate_api_key(api_key):
             return jsonify({"error": "Invalid API key"}), 401
-            
+
         client_id = request.headers.get('X-Client-ID', 'anonymous')
         if not security_manager.rate_limit_check(client_id):
             return jsonify({"error": "Rate limit exceeded"}), 429
@@ -394,38 +460,38 @@ def detailed_health_check():
 async def predict():
     start_time = time.time()
     metrics.inc_request_count('POST', '/predict')
-    
+
     try:
         data = request.get_json()
         image_b64 = data.get('image')
-        
+
         if not image_b64:
             return jsonify({"error": "No image provided"}), 400
-            
+
         image_bytes = processor.decode_base64_image(image_b64)
         image_hash = str(hash(image_bytes))
-        
+
         cached_result = cache_manager.get_prediction(image_hash)
         if cached_result:
             return jsonify(json.loads(cached_result))
-        
+
         processed_image = processor.preprocess_image(image_bytes)
         prediction = await triton_client.predict(processed_image)
-        
+
         predicted_class = np.argmax(prediction)
         confidence = float(np.max(prediction))
-        
+
         result = {
             "predicted_class": int(predicted_class),
             "confidence": confidence,
             "processing_time": time.time() - start_time
         }
-        
+
         cache_manager.set_prediction(image_hash, result)
-        
+
         metrics.observe_request_duration(time.time() - start_time)
         return jsonify(result)
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -437,22 +503,22 @@ def metrics_endpoint():
 async def batch_predict():
     start_time = time.time()
     metrics.inc_request_count('POST', '/batch_predict')
-    
+
     try:
         data = request.get_json()
         images = data.get('images', [])
-        
+
         if not images:
             return jsonify({"error": "No images provided"}), 400
-            
+
         tasks = []
         for img_b64 in images:
             image_bytes = processor.decode_base64_image(img_b64)
             processed_image = processor.preprocess_image(image_bytes)
             tasks.append(triton_client.predict(processed_image))
-        
+
         predictions = await asyncio.gather(*tasks)
-        
+
         results = []
         for pred in predictions:
             predicted_class = np.argmax(pred)
@@ -461,15 +527,15 @@ async def batch_predict():
                 "predicted_class": int(predicted_class),
                 "confidence": confidence
             })
-        
+
         response = {
             "predictions": results,
             "processing_time": time.time() - start_time
         }
-        
+
         metrics.observe_request_duration(time.time() - start_time)
         return jsonify(response)
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -490,7 +556,7 @@ class KubernetesDeployer:
         self.v1 = client.CoreV1Api()
         self.apps_v1 = client.AppsV1Api()
         self.autoscaling_v1 = client.AutoscalingV1Api()
-        
+
     def create_deployment(self):
         deployment_manifest = {
             "apiVersion": "apps/v1",
@@ -532,12 +598,12 @@ class KubernetesDeployer:
                 }
             }
         }
-        
+
         self.apps_v1.create_namespaced_deployment(
             body=deployment_manifest,
             namespace="default"
         )
-        
+
     def create_triton_deployment(self):
         triton_deployment = {
             "apiVersion": "apps/v1",
@@ -578,12 +644,12 @@ class KubernetesDeployer:
                 }
             }
         }
-        
+
         self.apps_v1.create_namespaced_deployment(
             body=triton_deployment,
             namespace="default"
         )
-        
+
     def create_services(self):
         api_service = {
             "apiVersion": "v1",
@@ -595,7 +661,7 @@ class KubernetesDeployer:
                 "type": "LoadBalancer"
             }
         }
-        
+
         triton_service = {
             "apiVersion": "v1",
             "kind": "Service",
@@ -609,7 +675,7 @@ class KubernetesDeployer:
                 ]
             }
         }
-        
+
         redis_service = {
             "apiVersion": "v1",
             "kind": "Service",
@@ -619,11 +685,11 @@ class KubernetesDeployer:
                 "ports": [{"port": 6379, "targetPort": 6379}]
             }
         }
-        
+
         self.v1.create_namespaced_service(body=api_service, namespace="default")
         self.v1.create_namespaced_service(body=triton_service, namespace="default")
         self.v1.create_namespaced_service(body=redis_service, namespace="default")
-        
+
     def create_hpa(self):
         hpa = {
             "apiVersion": "autoscaling/v1",
@@ -640,7 +706,7 @@ class KubernetesDeployer:
                 "targetCPUUtilizationPercentage": 70
             }
         }
-        
+
         self.autoscaling_v1.create_namespaced_horizontal_pod_autoscaler(
             body=hpa,
             namespace="default"
@@ -651,20 +717,20 @@ class AWSManager:
         self.eks_client = boto3.client('eks')
         self.s3_client = boto3.client('s3')
         self.ecr_client = boto3.client('ecr')
-        
+
     def upload_model_to_s3(self, model_path, bucket_name):
         for root, dirs, files in os.walk(model_path):
             for file in files:
                 local_path = os.path.join(root, file)
                 s3_path = os.path.relpath(local_path, model_path)
                 self.s3_client.upload_file(local_path, bucket_name, f"models/{s3_path}")
-                
+
     def create_ecr_repository(self, repository_name):
         try:
             self.ecr_client.create_repository(repositoryName=repository_name)
         except self.ecr_client.exceptions.RepositoryAlreadyExistsException:
             pass
-            
+
     def get_eks_cluster_info(self, cluster_name):
         response = self.eks_client.describe_cluster(name=cluster_name)
         return response['cluster']
@@ -672,30 +738,30 @@ class AWSManager:
 class LoadTester:
     def __init__(self, base_url):
         self.base_url = base_url
-        
+
     async def send_request(self, session, image_data):
         async with session.post(
             f"{self.base_url}/predict",
             json={"image": image_data}
         ) as response:
             return await response.json()
-            
+
     async def run_load_test(self, concurrent_users=100, requests_per_user=50):
         sample_image = base64.b64encode(b"fake_image_data").decode()
-        
+
         async with aiohttp.ClientSession() as session:
             tasks = []
             for user in range(concurrent_users):
                 for req in range(requests_per_user):
                     tasks.append(self.send_request(session, sample_image))
-            
+
             start_time = time.time()
             responses = await asyncio.gather(*tasks, return_exceptions=True)
             end_time = time.time()
-            
+
             successful_requests = len([r for r in responses if not isinstance(r, Exception)])
             total_time = end_time - start_time
-            
+
             print(f"Total requests: {len(tasks)}")
             print(f"Successful requests: {successful_requests}")
             print(f"Failed requests: {len(tasks) - successful_requests}")
@@ -709,7 +775,7 @@ class ModelOptimizer:
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
         tflite_model = converter.convert()
         return tflite_model
-        
+
     @staticmethod
     def quantize_model(model):
         converter = tf.lite.TFLiteConverter.from_keras_model(model)
@@ -728,14 +794,14 @@ if __name__ == "__main__":
     trainer = ModelTrainer()
     model = trainer.create_model()
     trainer.save_for_triton("./model_repository/image_classifier")
-    
+
     aws_manager = AWSManager()
     aws_manager.upload_model_to_s3("./model_repository", "ml-models-bucket")
-    
+
     deployer = KubernetesDeployer()
     deployer.create_deployment()
     deployer.create_triton_deployment()
     deployer.create_services()
     deployer.create_hpa()
-    
+
     app.run(host='0.0.0.0', port=5000)
