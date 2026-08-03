@@ -1,7 +1,7 @@
 import pytest
 import json
 import base64
-from app import app, cache_manager
+from ml_serving_platform import app, cache_manager
 import numpy as np
 
 @pytest.fixture
