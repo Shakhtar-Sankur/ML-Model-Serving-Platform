@@ -1,6 +1,6 @@
 import numpy as np
 import tensorflow as tf
-from app import ModelTrainer, ImageProcessor
+from ml_serving_platform import ModelTrainer, ImageProcessor
 
 def test_model_creation():
     trainer = ModelTrainer()
