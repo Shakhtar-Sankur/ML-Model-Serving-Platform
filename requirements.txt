@@ -1,0 +1,10 @@
+tensorflow==2.13.0
+flask==2.3.3
+numpy==1.24.3
+Pillow==10.0.0
+boto3==1.28.57
+kubernetes==27.2.0
+aiohttp==3.8.5
+redis==4.6.0
+prometheus-client==0.17.1
+gunicorn==21.2.0
