@@ -1,5 +1,7 @@
 tensorflow==2.13.0
 flask==2.3.3
+werkzeug==2.3.8       # unpinned, pip resolves 3.x, which flask 2.3.3 cannot use
+asgiref>=3.7.2        # /predict and /batch_predict are async views; Flask needs this
 numpy==1.24.3
 Pillow==10.0.0
 boto3==1.28.57

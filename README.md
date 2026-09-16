@@ -26,7 +26,7 @@ about everything around that call, which is where production time actually goes.
 | `TritonClient` | Inference backend |
 
 Supporting files: `Dockerfile`, `docker-compose.yml` for local runs, `build.sh` and
-`deploy.sh` for image build and Kubernetes rollout, and `test_api.py` / `test_model.py`.
+`deploy.sh` for image build and Kubernetes rollout, and the `tests/` suite.
 
 ## Design targets
 
@@ -47,8 +47,27 @@ architecture and algorithm choice, not as claims about observed performance.
 ```bash
 pip install -r requirements.txt
 docker compose up          # service, Redis and Triton
-pytest test_api.py test_model.py
+pytest tests -q
 ```
+
+## Tests
+
+```bash
+pytest tests -q            # 65 tests, no Redis, Triton or AWS required
+```
+
+Redis is replaced with an in-memory stand-in that reproduces its TTL semantics — `-2` for a
+missing key, `-1` for one with no expiry — because the rate limiter branches on exactly
+that. Triton is a stub, and the ResNet50 backbone is swapped for a tiny model of the same
+shape so no run downloads 100 MB of ImageNet weights.
+
+The defects listed under Status are each pinned by a test that fails against the original
+code: an empty API key authenticating, the read-compare-increment rate limiter, the
+breaker that never reset on success, and drift in two features cancelling out.
+
+TensorFlow is imported at the top of the service module, so the suite skips cleanly on a
+machine without it. CI installs `tensorflow-cpu` and runs it in full on Python 3.10 and
+3.11.
 
 ## Status
 
@@ -57,7 +76,7 @@ no trained model is bundled.
 
 ### Notes from a correctness pass
 
-Five defects fixed, one of them a security hole:
+Six defects fixed, one of them a security hole:
 
 - **An empty API key authenticated.** `api_key in os.getenv('VALID_API_KEYS', '').split(',')`
   splits an unset variable to `['']`, so an empty key matched — and unset is the default
@@ -77,6 +96,11 @@ Five defects fixed, one of them a security hole:
   by the feature count, and the report names which features moved.
 - `profile_inference` did not use `functools.wraps`, so decorating a Flask view erased its
   name and broke routing.
+- **`/predict` and `/batch_predict` are async views, and `asgiref` was not a dependency.**
+  Flask refuses to run an async view without it, so both prediction endpoints raised on
+  every request in a clean install. `werkzeug` was unpinned next to a pinned
+  `flask==2.3.3` as well, so a fresh install resolved a 3.x release that Flask cannot use.
+  Both are pinned in `requirements.txt` now.
 
 ## Licence
 
