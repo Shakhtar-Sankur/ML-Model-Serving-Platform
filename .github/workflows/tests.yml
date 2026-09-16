@@ -26,11 +26,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # One resolve for everything: installing in two passes let a later
+          # package pull typing-extensions past the ceiling TF 2.13 declares.
           # tensorflow-cpu rather than tensorflow: the GPU build pulls ~2 GB of
           # CUDA wheels that no runner here can use.
-          pip install "tensorflow-cpu==2.13.0"
-          pip install flask==2.3.3 werkzeug==2.3.8 "asgiref>=3.7.2" "numpy<2" Pillow boto3 redis \
-                      prometheus-client scipy psutil requests aiohttp pytest
+          pip install "tensorflow-cpu==2.13.0" "typing-extensions<4.6" \
+                      flask==2.3.3 werkzeug==2.3.8 "asgiref>=3.7.2" \
+                      "numpy<2" Pillow boto3 kubernetes redis prometheus-client \
+                      scipy psutil requests aiohttp pytest
 
       - name: Run tests
         env:
